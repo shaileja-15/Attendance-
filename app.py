@@ -1,120 +1,134 @@
 import streamlit as st
+import easyocr
 import cv2
 import numpy as np
 import pandas as pd
-import easyocr
 from PIL import Image
 import tempfile
 
-st.set_page_config(page_title="Attendance Digitizer", layout="wide")
+st.set_page_config(page_title="Attendance Sheet Digitizer", layout="wide")
 
-st.title("📋 Handwritten Attendance Sheet Digitizer")
+st.title("📋 Attendance Sheet → Excel Converter (Handwriting OCR)")
 
-st.write("Upload attendance sheet image → Get structured Excel")
+st.write("Upload attendance sheet image. System will extract names and P/AB marks. You can edit before export.")
 
-uploaded = st.file_uploader("Upload Image", type=["png","jpg","jpeg"])
+# -------------------------
+# Load OCR reader (cached)
+# -------------------------
+@st.cache_resource
+def load_reader():
+    return easyocr.Reader(['en'])
+
+reader = load_reader()
+
+# -------------------------
+# Upload Image
+# -------------------------
+uploaded = st.file_uploader("Upload attendance sheet image", type=["jpg","jpeg","png"])
 
 if uploaded:
 
-    # save temp image
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        tmp.write(uploaded.read())
-        path = tmp.name
+    image = Image.open(uploaded)
+    st.image(image, caption="Uploaded Image", use_column_width=True)
 
-    img = cv2.imread(path)
-
-    # auto rotate if sideways
-    h,w = img.shape[:2]
-    if w > h:
-        img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
+    # Convert to OpenCV format
+    img = np.array(image)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # -------- preprocess --------
-    thresh = cv2.adaptiveThreshold(
+    # Improve contrast
+    gray = cv2.adaptiveThreshold(
         gray,255,
-        cv2.ADAPTIVE_THRESH_MEAN_C,
-        cv2.THRESH_BINARY_INV,15,4
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,11,2
     )
 
-    # -------- detect grid --------
-    vk = cv2.getStructuringElement(cv2.MORPH_RECT,(1,60))
-    hk = cv2.getStructuringElement(cv2.MORPH_RECT,(60,1))
+    st.subheader("🔍 Running OCR...")
+    results = reader.readtext(gray)
 
-    grid = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vk) + \
-           cv2.morphologyEx(thresh, cv2.MORPH_OPEN, hk)
+    texts = [r[1] for r in results]
 
-    cnts,_ = cv2.findContours(grid, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    # -------------------------
+    # Extract names
+    # -------------------------
+    names = []
+    for t in texts:
+        if len(t) > 5 and t.replace(" ", "").isalpha():
+            names.append(t.title())
 
-    boxes=[]
-    for c in cnts:
-        x,y,w,h = cv2.boundingRect(c)
-        if w>80 and h>30:
-            boxes.append((x,y,w,h))
+    # remove duplicates
+    names = list(dict.fromkeys(names))
 
-    boxes = sorted(boxes, key=lambda b:(b[1],b[0]))
+    # -------------------------
+    # Extract P / AB marks
+    # -------------------------
+    marks = []
+    for t in texts:
+        val = t.upper().strip()
 
-    # -------- group rows --------
-    rows=[]
-    cur=[]
-    last_y=-100
+        if val in ["P","A","AB"]:
+            marks.append(val)
 
-    for b in boxes:
-        if abs(b[1]-last_y) < 40:
-            cur.append(b)
-        else:
-            if cur:
-                rows.append(sorted(cur))
-            cur=[b]
-            last_y=b[1]
+    # -------------------------
+    # Guess number of sessions
+    # -------------------------
+    if len(names) > 0:
+        sessions = max(1, len(marks)//len(names))
+    else:
+        sessions = 1
 
-    if cur:
-        rows.append(sorted(cur))
+    # -------------------------
+    # Build attendance table
+    # -------------------------
+    data = []
 
-    st.info(f"Detected {len(rows)} rows")
+    idx = 0
+    for n in names:
+        row = {"Name": n}
+        for s in range(sessions):
+            if idx < len(marks):
+                row[f"S{s+1}"] = marks[idx]
+            else:
+                row[f"S{s+1}"] = ""
+            idx += 1
+        data.append(row)
 
-    # -------- OCR --------
-    with st.spinner("Reading handwriting..."):
-        reader = easyocr.Reader(['en'])
+    df = pd.DataFrame(data)
 
-        table=[]
-
-        for row in rows:
-            r=[]
-            for (x,y,w,h) in row:
-                crop = gray[y:y+h, x:x+w]
-                txt = reader.readtext(crop, detail=0)
-                val = txt[0] if txt else ""
-
-                val = val.upper().strip()
-
-                # attendance cleaning
-                if "AB" in val:
-                    val = "A"
-                elif val == "A":
-                    val = "A"
-                elif "P" in val:
-                    val = "P"
-
-                r.append(val)
-
-            table.append(r)
-
-    # normalize columns
-    maxc = max(len(r) for r in table)
-    for r in table:
-        r += [""]*(maxc-len(r))
-
-    df = pd.DataFrame(table)
-
-    st.subheader("📊 Detected Table (Editable)")
+    # -------------------------
+    # Editable table
+    # -------------------------
+    st.subheader("✏️ Edit if needed")
     edited = st.data_editor(df, use_container_width=True)
 
-    # -------- download --------
-    excel_bytes = edited.to_excel(index=False, engine="openpyxl")
+    # -------------------------
+    # Totals
+    # -------------------------
+    if not edited.empty:
+        session_cols = [c for c in edited.columns if c.startswith("S")]
 
-    st.download_button(
-        "⬇ Download Excel",
-        excel_bytes,
-        file_name="attendance.xlsx"
-    )
+        edited["Present"] = edited[session_cols].apply(
+            lambda r: sum(x=="P" for x in r), axis=1)
+
+        edited["Absent"] = edited[session_cols].apply(
+            lambda r: sum(x in ["A","AB"] for x in r), axis=1)
+
+        edited["Attendance %"] = (
+            edited["Present"] /
+            (edited["Present"] + edited["Absent"]).replace(0,1)
+        ) * 100
+
+        st.subheader("📊 Final Table")
+        st.dataframe(edited)
+
+        # -------------------------
+        # Download Excel
+        # -------------------------
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+        edited.to_excel(tmp.name, index=False)
+
+        with open(tmp.name, "rb") as f:
+            st.download_button(
+                "⬇️ Download Excel",
+                f,
+                file_name="attendance.xlsx"
+            )
